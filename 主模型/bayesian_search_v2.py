@@ -126,7 +126,7 @@ def compute_metrics(y_true, y_pred):
     ss_res = np.sum((y_true - y_pred) ** 2)
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
     r2 = 1 - ss_res / (ss_tot + 1e-8)
-    return {"MAE": mae, "MAPE(%)": mape, "RMSE": rmse, "R2": r2}
+    return {"MAE": mae, "MAPE": mape, "RMSE": rmse, "R2": r2}
 
 
 def evaluate(model, loader, device):
