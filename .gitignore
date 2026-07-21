@@ -1,0 +1,29 @@
+# 模型权重
+*.pth
+*.pt
+*.ckpt
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 训练产物
+results/
+logs/
+wandb/
+
+# 环境
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+:Zone.Identifier
+:Zone.Identifier
+*.pth
