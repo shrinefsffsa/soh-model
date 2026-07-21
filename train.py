@@ -56,8 +56,9 @@ def compute_metrics(model, loader, device):
 
     rmse = np.sqrt(mean_squared_error(targets, preds))
     mae = mean_absolute_error(targets, preds)
+    mape = np.mean(np.abs((targets - preds) / (targets + 1e-8)))
     r2 = r2_score(targets, preds)
-    return {"RMSE": rmse, "MAE": mae, "R²": r2}
+    return {"RMSE": rmse, "MAE": mae, "MAPE": mape, "R²": r2}
 
 
 # ═══════════════════════════════════════════════════════════════
