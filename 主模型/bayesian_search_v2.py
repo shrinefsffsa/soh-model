@@ -1,13 +1,23 @@
 """
-贝叶斯超参数搜索 v2：基于 Optuna 的 TPE 采样器
-自动搜索 MainSOHModelV2 的最优超参数组合，目标是最小化验证 MAE。
+贝叶斯超参数搜索 v2：基于 Optuna TPE 采样器 + k-fold 交叉验证。
 
-注意：当前使用伪数据演示流程。接入真实电池数据时，
-      请把 make_data() 替换为你的数据加载器，并确保验证集按电池单元划分，
-      避免同一电池样本同时出现在训练/验证集中造成数据泄漏。
+每个 trial 跑全部 fold，取 fold 平均 MAE 作为优化目标，
+搜索结束后用最佳参数跑最终评估（全部指标）。
+
+用法:
+    # 默认：Batch-1, seq_len=32, 30 trials
+    python 主模型/bayesian_search_v2.py
+
+    # 指定数据集和 seq_len
+    python 主模型/bayesian_search_v2.py --dataset calce --seq_len 64 --trials 50
 """
 
+import argparse
 import json
+import os
+import sys
+import time
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,33 +28,18 @@ import optuna
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
 
+# 把项目根目录加入路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from model_v2 import MainSOHModelV2
+from data_loader import DATASET_REGISTRY, load_fold, get_fold_count
 
 
 # ═══════════════════════════════════════════════════════════════
-# 1. 数据准备（伪数据，仅作流程验证）
-# ═══════════════════════════════════════════════════════════════
-def make_data(n_samples=600, in_channels=3, seq_len=32, seed=42):
-    torch.manual_seed(seed)
-    X = torch.randn(n_samples, in_channels, seq_len)
-    y = torch.sigmoid(
-        0.3 * X[:, 0, :].mean(dim=1)
-        + 0.2 * X[:, 1, :].std(dim=1)
-        - 0.1 * X[:, 2, :].max(dim=1)[0]
-    ).unsqueeze(1)
-    return X, y
-
-
-# ═══════════════════════════════════════════════════════════════
-# 2. 超参数采样 + 模型构造
+# 1. 超参数搜索空间
 # ═══════════════════════════════════════════════════════════════
 def suggest_hyperparams(trial):
-    """定义贝叶斯搜索空间，返回一个参数字典。"""
-
-    # ----- 模型结构超参数 -----
     hidden_dim = trial.suggest_categorical("hidden_dim", [32, 64, 128])
-
-    # num_heads 必须整除 hidden_dim
     head_candidates = [h for h in [2, 4, 8] if hidden_dim % h == 0]
     num_heads = trial.suggest_categorical("num_heads", head_candidates)
 
@@ -53,7 +48,6 @@ def suggest_hyperparams(trial):
     dropout = trial.suggest_float("dropout", 0.1, 0.5)
     gru_dropout = trial.suggest_float("gru_dropout", 0.0, 0.3)
 
-    # ----- 训练超参数 -----
     batch_size = trial.suggest_categorical("batch_size", [8, 16, 32])
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
@@ -71,52 +65,53 @@ def suggest_hyperparams(trial):
     }
 
 
-def build_model(params, in_channels=3, seq_len=32, device="cpu"):
-    """根据已采样的参数字典构造模型、优化器和训练配置。"""
+# ═══════════════════════════════════════════════════════════════
+# 2. 单 fold 训练
+# ═══════════════════════════════════════════════════════════════
+def train_one_fold(model, train_loader, val_loader, params, max_epochs, device, patience=20):
+    """训练单个 fold，早停后返回最佳验证 MAE。"""
+    criterion = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=params["lr"], weight_decay=params["weight_decay"])
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-6)
 
-    model = MainSOHModelV2(
-        in_channels=in_channels,
-        seq_len=seq_len,
-        hidden_dim=params["hidden_dim"],
-        num_heads=params["num_heads"],
-        cnn_layers=params["cnn_layers"],
-        gru_layers=params["gru_layers"],
-        gru_dropout=params["gru_dropout"],
-        se_reduction=4,
-        dropout=params["dropout"],
-        output_dim=1,
-    ).to(device)
+    best_mae = float("inf")
+    patience_counter = 0
 
-    criterion = nn.L1Loss()  # MAE
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=params["lr"],
-        weight_decay=params["weight_decay"],
-    )
+    for epoch in range(max_epochs):
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(xb), yb.view(-1, 1))
+            loss.backward()
+            optimizer.step()
 
-    return model, criterion, optimizer
+        model.eval()
+        val_mae_sum = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                val_mae_sum += nn.L1Loss()(model(xb), yb.view(-1, 1)).item() * xb.size(0)
+        val_mae = val_mae_sum / len(val_loader.dataset)
+
+        scheduler.step(val_mae)
+
+        if val_mae < best_mae:
+            best_mae = val_mae
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
+
+    return best_mae
 
 
 # ═══════════════════════════════════════════════════════════════
-# 3. 训练与验证辅助函数
+# 3. 评估指标
 # ═══════════════════════════════════════════════════════════════
-def train_epoch(model, loader, criterion, optimizer, device):
-    model.train()
-    total_loss = 0.0
-    for xb, yb in loader:
-        xb, yb = xb.to(device), yb.to(device)
-        optimizer.zero_grad()
-        pred = model(xb)
-        loss = criterion(pred, yb)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * xb.size(0)
-    return total_loss / len(loader.dataset)
-
-
 @torch.no_grad()
 def compute_metrics(y_true, y_pred):
-    """计算 MAE, MAPE, RMSE, R²。"""
     y_true = y_true.cpu().numpy()
     y_pred = y_pred.cpu().numpy()
 
@@ -129,99 +124,156 @@ def compute_metrics(y_true, y_pred):
     return {"MAE": mae, "MAPE": mape, "RMSE": rmse, "R2": r2}
 
 
-def evaluate(model, loader, device):
+def evaluate_fold(model, loader, device):
     model.eval()
     all_preds, all_targets = [], []
     for xb, yb in loader:
         xb, yb = xb.to(device), yb.to(device)
-        pred = model(xb)
-        all_preds.append(pred)
-        all_targets.append(yb)
+        all_preds.append(model(xb))
+        all_targets.append(yb.view(-1, 1))
     return compute_metrics(torch.cat(all_targets), torch.cat(all_preds))
 
 
 # ═══════════════════════════════════════════════════════════════
-# 4. Optuna 目标函数
+# 4. Optuna 目标函数 — k-fold 交叉验证
 # ═══════════════════════════════════════════════════════════════
-def objective(trial, in_channels=3, seq_len=32, max_epochs=100, device="cpu"):
+def objective(trial, dataset, seq_len, max_epochs, device):
     params = suggest_hyperparams(trial)
+    n_folds = get_fold_count(dataset, seq_len)
 
-    X, y = make_data(n_samples=600, in_channels=in_channels, seq_len=seq_len)
-    n_train = int(0.8 * len(X))
-    X_train, y_train = X[:n_train], y[:n_train]
-    X_val, y_val = X[n_train:], y[n_train:]
+    fold_maes = []
 
-    train_loader = DataLoader(
-        TensorDataset(X_train, y_train),
-        batch_size=params["batch_size"],
-        shuffle=True,
-    )
-    val_loader = DataLoader(
-        TensorDataset(X_val, y_val),
-        batch_size=64,
-    )
+    for fold_idx in range(n_folds):
+        # 加载数据
+        X_train, y_train, X_test, y_test = load_fold(dataset, seq_len, fold_idx)
+        train_loader = DataLoader(
+            TensorDataset(X_train, y_train),
+            batch_size=params["batch_size"], shuffle=True,
+        )
+        val_loader = DataLoader(
+            TensorDataset(X_test, y_test),
+            batch_size=64, shuffle=False,
+        )
 
-    model, criterion, optimizer = build_model(params, in_channels, seq_len, device)
+        # 构造模型
+        model = MainSOHModelV2(
+            in_channels=3, seq_len=seq_len,
+            hidden_dim=params["hidden_dim"],
+            num_heads=params["num_heads"],
+            cnn_layers=params["cnn_layers"],
+            gru_layers=params["gru_layers"],
+            gru_dropout=params["gru_dropout"],
+            se_reduction=4,
+            dropout=params["dropout"],
+            output_dim=1,
+        ).to(device)
 
-    best_val_loss = float("inf")
-    patience_counter = 0
-    patience = 20
+        fold_mae = train_one_fold(model, train_loader, val_loader, params, max_epochs, device)
+        fold_maes.append(fold_mae)
 
-    for epoch in range(max_epochs):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-
-        # 按 epoch 用 MAE 做剪枝
-        model.eval()
-        val_mae_sum = 0.0
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                val_mae_sum += nn.L1Loss()(model(xb), yb).item() * xb.size(0)
-        val_mae = val_mae_sum / len(val_loader.dataset)
-
-        trial.report(val_mae, epoch)
+        # 向 Optuna 报告中间结果（运行中 fold 的平均 MAE，用于剪枝）
+        trial.report(np.mean(fold_maes), fold_idx)
         if trial.should_prune():
             raise optuna.TrialPruned()
 
-        if val_mae < best_val_loss:
-            best_val_loss = val_mae
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                break
-
-    return best_val_loss
+    return np.mean(fold_maes)
 
 
 # ═══════════════════════════════════════════════════════════════
 # 5. 主函数
 # ═══════════════════════════════════════════════════════════════
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
+    parser = argparse.ArgumentParser(description="贝叶斯超参数搜索")
+    parser.add_argument("--dataset", type=str, default="xjtu_batch1",
+                        choices=list(DATASET_REGISTRY.keys()))
+    parser.add_argument("--seq_len", type=int, default=32, choices=[32, 64, 128])
+    parser.add_argument("--trials", type=int, default=30, help="Optuna trial 数")
+    parser.add_argument("--epochs", type=int, default=60, help="每 fold 最大 epoch")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda"])
+    args = parser.parse_args()
 
+    # 设备
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+
+    # 随机种子
+    import random
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    n_folds = get_fold_count(args.dataset, args.seq_len)
+    print(f"数据集: {args.dataset}  |  seq_len: {args.seq_len}  |  folds: {n_folds}")
+    print(f"设备: {device}  |  trials: {args.trials}  |  每 fold 最大 epochs: {args.epochs}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    # ── 搜索 ──
     study = optuna.create_study(
         direction="minimize",
-        sampler=TPESampler(seed=42),
-        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=10),
+        sampler=TPESampler(seed=args.seed),
+        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=3),
     )
 
-    func = lambda trial: objective(trial, in_channels=3, seq_len=32, max_epochs=100, device=device)
+    func = lambda trial: objective(trial, args.dataset, args.seq_len, args.epochs, device)
 
-    n_trials = 30
-    study.optimize(func, n_trials=n_trials, show_progress_bar=True)
+    t_start = time.time()
+    study.optimize(func, n_trials=args.trials, show_progress_bar=True)
+    elapsed = time.time() - t_start
 
     print("\n" + "=" * 60)
-    print("贝叶斯搜索完成")
-    print(f"最佳验证 MAE: {study.best_value:.6f}")
+    print(f"搜索完成  |  耗时: {elapsed/60:.1f} min")
+    print(f"最佳 {n_folds}-fold 平均 MAE: {study.best_value:.6f}")
     print("最佳超参数:")
     for key, value in study.best_params.items():
         print(f"  {key}: {value}")
 
-    with open("best_hyperparams_v2.json", "w", encoding="utf-8") as f:
-        json.dump(study.best_params, f, indent=2, ensure_ascii=False)
-    print("最佳参数已保存到 best_hyperparams_v2.json")
+    # 保存最佳参数
+    os.makedirs("results", exist_ok=True)
+    out_path = f"results/best_params_{args.dataset}_n{args.seq_len}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"best_mae": study.best_value, **study.best_params}, f, indent=2, ensure_ascii=False)
+    print(f"\n参数已保存: {out_path}")
+
+    # ── 最终评估：用最佳参数跑全部 fold，输出四个指标 ──
+    print("\n" + "=" * 60)
+    print("用最佳参数跑全部 fold 最终评估...")
+    best_params = study.best_params
+
+    all_metrics = {"MAE": [], "MAPE": [], "RMSE": [], "R2": []}
+    for fold_idx in range(n_folds):
+        X_train, y_train, X_test, y_test = load_fold(args.dataset, args.seq_len, fold_idx)
+        train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=best_params["batch_size"], shuffle=True)
+        test_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=64, shuffle=False)
+
+        model = MainSOHModelV2(
+            in_channels=3, seq_len=args.seq_len,
+            hidden_dim=best_params["hidden_dim"],
+            num_heads=best_params["num_heads"],
+            cnn_layers=best_params["cnn_layers"],
+            gru_layers=best_params["gru_layers"],
+            gru_dropout=best_params["gru_dropout"],
+            se_reduction=4, dropout=best_params["dropout"], output_dim=1,
+        ).to(device)
+
+        _ = train_one_fold(model, train_loader, test_loader, best_params, args.epochs, device)
+        metrics = evaluate_fold(model, test_loader, device)
+        for k in all_metrics:
+            all_metrics[k].append(metrics[k])
+        print(f"  fold {fold_idx}: MAE={metrics['MAE']:.4f}  RMSE={metrics['RMSE']:.4f}  R2={metrics['R2']:.4f}")
+
+    print(f"\n  ── {n_folds}-fold 平均 ──")
+    for k, vs in all_metrics.items():
+        arr = np.array(vs)
+        print(f"  {k}: {np.mean(arr):.4f} ± {np.std(arr):.4f}")
 
 
 if __name__ == "__main__":
