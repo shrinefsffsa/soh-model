@@ -40,14 +40,15 @@ from data_loader import DATASET_REGISTRY, load_fold, get_fold_count
 # 1. 超参数搜索空间
 # ═══════════════════════════════════════════════════════════════
 def suggest_hyperparams(trial):
-    hidden_dim = trial.suggest_categorical("hidden_dim", [32, 64, 128])
+    hidden_dim = trial.suggest_categorical("hidden_dim", [64, 128, 256])
     head_candidates = [h for h in [2, 4, 8] if hidden_dim % h == 0]
     num_heads = trial.suggest_categorical("num_heads", head_candidates)
 
+    se_reduction = trial.suggest_categorical("se_reduction", [2, 4, 8])
     cnn_layers = trial.suggest_int("cnn_layers", 1, 3)
     gru_layers = trial.suggest_int("gru_layers", 1, 3)
     dropout = trial.suggest_float("dropout", 0.1, 0.5)
-    gru_dropout = trial.suggest_float("gru_dropout", 0.0, 0.3)
+    gru_dropout = trial.suggest_float("gru_dropout", 1e-3, 0.3, log=True)
 
     batch_size = trial.suggest_categorical("batch_size", [8, 16, 32])
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
@@ -56,6 +57,7 @@ def suggest_hyperparams(trial):
     return {
         "hidden_dim": hidden_dim,
         "num_heads": num_heads,
+        "se_reduction": se_reduction,
         "cnn_layers": cnn_layers,
         "gru_layers": gru_layers,
         "dropout": dropout,
@@ -149,8 +151,9 @@ def objective(trial, dataset, seq_len, max_epochs, device):
         X_train_all, y_train_all, X_test, y_test = load_fold(dataset, seq_len, fold_idx)
 
         # 从训练集切 20% 做验证（早停用），测试集完全不参与训练
+        # 不同 trial 使用不同种子，增加搜索鲁棒性
         X_train, X_val, y_train, y_val = train_test_split(
-            X_train_all, y_train_all, test_size=0.2, random_state=42
+            X_train_all, y_train_all, test_size=0.2, random_state=42 + trial.number
         )
         train_loader = DataLoader(
             TensorDataset(X_train, y_train),
@@ -161,7 +164,7 @@ def objective(trial, dataset, seq_len, max_epochs, device):
             batch_size=64, shuffle=False,
         )
 
-        # 构造模型
+        # 构造模型（含搜索到的 kernel_size 和 se_reduction）
         model = MainSOHModelV2(
             in_channels=3, seq_len=seq_len,
             hidden_dim=params["hidden_dim"],
@@ -169,10 +172,12 @@ def objective(trial, dataset, seq_len, max_epochs, device):
             cnn_layers=params["cnn_layers"],
             gru_layers=params["gru_layers"],
             gru_dropout=params["gru_dropout"],
-            se_reduction=4,
+            se_reduction=params["se_reduction"],
             dropout=params["dropout"],
             output_dim=1,
         ).to(device)
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        trial.set_user_attr("n_params", n_params)
 
         # 训练（用 val 做早停）
         train_one_fold(model, train_loader, val_loader, params, max_epochs, device)
@@ -248,12 +253,12 @@ def main():
         study_name=f"{args.dataset}_n{args.seq_len}",
         direction="minimize",
         sampler=TPESampler(seed=args.seed),
-        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=3),
+        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=1),
         storage=f"sqlite:///{db_path}",
         load_if_exists=True,
     )
 
-    func = lambda trial: objective(trial, args.dataset, args.seq_len, args.epochs, device)
+    func = lambda trial: objective(trial, args.dataset, args.seq_len, args.epochs, device, args.seed)
 
     t_start = time.time()
     study.optimize(func, n_trials=args.trials, show_progress_bar=True)
@@ -299,7 +304,7 @@ def main():
 
         # 切 20% 验证集
         X_train, X_val, y_train, y_val = train_test_split(
-            X_train_all, y_train_all, test_size=0.2, random_state=42
+            X_train_all, y_train_all, test_size=0.2, random_state=args.seed
         )
         train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=best_params["batch_size"], shuffle=True)
         val_loader   = DataLoader(TensorDataset(X_val, y_val), batch_size=64, shuffle=False)
@@ -312,8 +317,11 @@ def main():
             cnn_layers=best_params["cnn_layers"],
             gru_layers=best_params["gru_layers"],
             gru_dropout=best_params["gru_dropout"],
-            se_reduction=4, dropout=best_params["dropout"], output_dim=1,
+            se_reduction=best_params["se_reduction"],
+            dropout=best_params["dropout"], output_dim=1,
         ).to(device)
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  fold {fold_idx} 参数量: {n_params:,}")
 
         train_one_fold(model, train_loader, val_loader, best_params, args.final_epochs, device)
         metrics = evaluate_fold(model, test_loader, device)
