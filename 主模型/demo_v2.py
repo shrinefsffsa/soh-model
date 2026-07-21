@@ -42,7 +42,7 @@ def compute_metrics(y_true, y_pred):
 
     mae = np.mean(np.abs(y_true - y_pred))
     # MAPE: 避免除零，SOH > 0.01 正常情况不会出现
-    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8)))
     rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
     ss_res = np.sum((y_true - y_pred) ** 2)
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)

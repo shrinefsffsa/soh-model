@@ -121,7 +121,7 @@ def compute_metrics(y_true, y_pred):
     y_pred = y_pred.cpu().numpy()
 
     mae = np.mean(np.abs(y_true - y_pred))
-    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8)))
     rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
     ss_res = np.sum((y_true - y_pred) ** 2)
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
