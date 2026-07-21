@@ -200,7 +200,8 @@ def main():
     parser = argparse.ArgumentParser(description="贝叶斯超参数搜索")
     parser.add_argument("--dataset", type=str, default="xjtu_batch1",
                         choices=list(DATASET_REGISTRY.keys()))
-    parser.add_argument("--seq_len", type=int, default=32, choices=[32, 64, 128])
+    parser.add_argument("--seq_len", type=str, default="32",
+                        help="序列长度: 32, 64, 128, 或 all（依次跑三个）")
     parser.add_argument("--trials", type=int, default=30, help="Optuna trial 数")
     parser.add_argument("--epochs", type=int, default=60, help="搜索阶段每 fold 最大 epoch（少一点，快筛）")
     parser.add_argument("--final_epochs", type=int, default=200, help="最佳参数重跑时的 epoch（充足，出最终结果）")
@@ -208,6 +209,9 @@ def main():
     parser.add_argument("--device", type=str, default="auto",
                         choices=["auto", "cpu", "cuda"])
     args = parser.parse_args()
+
+    # 解析 seq_len
+    seq_lens = [32, 64, 128] if args.seq_len == "all" else [int(args.seq_len)]
 
     # 设备
     if args.device == "auto":
@@ -225,14 +229,20 @@ def main():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-    n_folds = get_fold_count(args.dataset, args.seq_len)
-    print(f"数据集: {args.dataset}  |  seq_len: {args.seq_len}  |  folds: {n_folds}")
-    print(f"设备: {device}  |  trials: {args.trials}  |  每 fold 最大 epochs: {args.epochs}")
-    if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    for sl in seq_lens:
+        args.seq_len = sl
+        print(f"\n{'#' * 50}")
+        print(f"#  seq_len = {sl}")
+        print(f"{'#' * 50}")
 
-    # ── 搜索（SQLite 持久化，所有 trial 写入磁盘） ──
-    os.makedirs("results", exist_ok=True)
+        n_folds = get_fold_count(args.dataset, args.seq_len)
+        print(f"数据集: {args.dataset}  |  seq_len: {args.seq_len}  |  folds: {n_folds}")
+        print(f"设备: {device}  |  trials: {args.trials}  |  每 fold 最大 epochs: {args.epochs}")
+        if device.type == "cuda":
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+        # ── 搜索（SQLite 持久化，所有 trial 写入磁盘） ──
+        os.makedirs("results", exist_ok=True)
     db_path = f"results/optuna_{args.dataset}_n{args.seq_len}.db"
     study = optuna.create_study(
         study_name=f"{args.dataset}_n{args.seq_len}",
