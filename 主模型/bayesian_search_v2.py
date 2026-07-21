@@ -188,7 +188,8 @@ def main():
                         choices=list(DATASET_REGISTRY.keys()))
     parser.add_argument("--seq_len", type=int, default=32, choices=[32, 64, 128])
     parser.add_argument("--trials", type=int, default=30, help="Optuna trial 数")
-    parser.add_argument("--epochs", type=int, default=60, help="每 fold 最大 epoch")
+    parser.add_argument("--epochs", type=int, default=60, help="搜索阶段每 fold 最大 epoch（少一点，快筛）")
+    parser.add_argument("--final_epochs", type=int, default=200, help="最佳参数重跑时的 epoch（充足，出最终结果）")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto",
                         choices=["auto", "cpu", "cuda"])
@@ -264,7 +265,7 @@ def main():
             se_reduction=4, dropout=best_params["dropout"], output_dim=1,
         ).to(device)
 
-        _ = train_one_fold(model, train_loader, test_loader, best_params, args.epochs, device)
+        _ = train_one_fold(model, train_loader, test_loader, best_params, args.final_epochs, device)
         metrics = evaluate_fold(model, test_loader, device)
         for k in all_metrics:
             all_metrics[k].append(metrics[k])
