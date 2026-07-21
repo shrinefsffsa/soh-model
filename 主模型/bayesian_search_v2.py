@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
 
 import optuna
 from optuna.samplers import TPESampler
@@ -144,14 +145,19 @@ def objective(trial, dataset, seq_len, max_epochs, device):
     fold_maes = []
 
     for fold_idx in range(n_folds):
-        # 加载数据
-        X_train, y_train, X_test, y_test = load_fold(dataset, seq_len, fold_idx)
+        # 加载数据：test 是一个完整电池，train 是其余电池
+        X_train_all, y_train_all, X_test, y_test = load_fold(dataset, seq_len, fold_idx)
+
+        # 从训练集切 20% 做验证（早停用），测试集完全不参与训练
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train_all, y_train_all, test_size=0.2, random_state=42
+        )
         train_loader = DataLoader(
             TensorDataset(X_train, y_train),
             batch_size=params["batch_size"], shuffle=True,
         )
         val_loader = DataLoader(
-            TensorDataset(X_test, y_test),
+            TensorDataset(X_val, y_val),
             batch_size=64, shuffle=False,
         )
 
@@ -168,8 +174,16 @@ def objective(trial, dataset, seq_len, max_epochs, device):
             output_dim=1,
         ).to(device)
 
-        fold_mae = train_one_fold(model, train_loader, val_loader, params, max_epochs, device)
-        fold_maes.append(fold_mae)
+        # 训练（用 val 做早停）
+        train_one_fold(model, train_loader, val_loader, params, max_epochs, device)
+
+        # 最终评估：用测试集（不参与训练的完整电池）
+        test_loader = DataLoader(
+            TensorDataset(X_test, y_test),
+            batch_size=64, shuffle=False,
+        )
+        test_metrics = evaluate_fold(model, test_loader, device)
+        fold_maes.append(test_metrics["MAE"])
 
         # 向 Optuna 报告中间结果（运行中 fold 的平均 MAE，用于剪枝）
         trial.report(np.mean(fold_maes), fold_idx)
@@ -217,11 +231,16 @@ def main():
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # ── 搜索 ──
+    # ── 搜索（SQLite 持久化，所有 trial 写入磁盘） ──
+    os.makedirs("results", exist_ok=True)
+    db_path = f"results/optuna_{args.dataset}_n{args.seq_len}.db"
     study = optuna.create_study(
+        study_name=f"{args.dataset}_n{args.seq_len}",
         direction="minimize",
         sampler=TPESampler(seed=args.seed),
         pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=3),
+        storage=f"sqlite:///{db_path}",
+        load_if_exists=True,
     )
 
     func = lambda trial: objective(trial, args.dataset, args.seq_len, args.epochs, device)
@@ -232,13 +251,28 @@ def main():
 
     print("\n" + "=" * 60)
     print(f"搜索完成  |  耗时: {elapsed/60:.1f} min")
+
+    # ── 导出所有 trial 数据（论文用） ──
+    trials_df = study.trials_dataframe()
+    trials_df.to_csv(f"results/all_trials_{args.dataset}_n{args.seq_len}.csv", index=False)
+    print(f"全部 {len(study.trials)} 个 trial 已保存到 results/all_trials_{args.dataset}_n{args.seq_len}.csv")
+
+    # 超参重要性
+    try:
+        importance = optuna.importance.get_param_importances(study)
+        with open(f"results/param_importance_{args.dataset}_n{args.seq_len}.json", "w") as f:
+            json.dump({k: float(v) for k, v in importance.items()}, f, indent=2)
+        print("超参数重要性：")
+        for k, v in sorted(importance.items(), key=lambda x: -x[1]):
+            print(f"  {k}: {v:.3f}")
+    except Exception:
+        pass
     print(f"最佳 {n_folds}-fold 平均 MAE: {study.best_value:.6f}")
     print("最佳超参数:")
     for key, value in study.best_params.items():
         print(f"  {key}: {value}")
 
     # 保存最佳参数
-    os.makedirs("results", exist_ok=True)
     out_path = f"results/best_params_{args.dataset}_n{args.seq_len}.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"best_mae": study.best_value, **study.best_params}, f, indent=2, ensure_ascii=False)
@@ -251,9 +285,15 @@ def main():
 
     all_metrics = {"MAE": [], "MAPE": [], "RMSE": [], "R2": []}
     for fold_idx in range(n_folds):
-        X_train, y_train, X_test, y_test = load_fold(args.dataset, args.seq_len, fold_idx)
+        X_train_all, y_train_all, X_test, y_test = load_fold(args.dataset, args.seq_len, fold_idx)
+
+        # 切 20% 验证集
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train_all, y_train_all, test_size=0.2, random_state=42
+        )
         train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=best_params["batch_size"], shuffle=True)
-        test_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=64, shuffle=False)
+        val_loader   = DataLoader(TensorDataset(X_val, y_val), batch_size=64, shuffle=False)
+        test_loader  = DataLoader(TensorDataset(X_test, y_test), batch_size=64, shuffle=False)
 
         model = MainSOHModelV2(
             in_channels=3, seq_len=args.seq_len,
@@ -265,7 +305,7 @@ def main():
             se_reduction=4, dropout=best_params["dropout"], output_dim=1,
         ).to(device)
 
-        _ = train_one_fold(model, train_loader, test_loader, best_params, args.final_epochs, device)
+        train_one_fold(model, train_loader, val_loader, best_params, args.final_epochs, device)
         metrics = evaluate_fold(model, test_loader, device)
         for k in all_metrics:
             all_metrics[k].append(metrics[k])
