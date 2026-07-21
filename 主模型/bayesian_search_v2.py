@@ -8,6 +8,7 @@
 """
 
 import json
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -114,15 +115,29 @@ def train_epoch(model, loader, criterion, optimizer, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def compute_metrics(y_true, y_pred):
+    """计算 MAE, MAPE, RMSE, R²。"""
+    y_true = y_true.cpu().numpy()
+    y_pred = y_pred.cpu().numpy()
+
+    mae = np.mean(np.abs(y_true - y_pred))
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
+    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    r2 = 1 - ss_res / (ss_tot + 1e-8)
+    return {"MAE": mae, "MAPE(%)": mape, "RMSE": rmse, "R2": r2}
+
+
+def evaluate(model, loader, device):
     model.eval()
-    total_loss = 0.0
+    all_preds, all_targets = [], []
     for xb, yb in loader:
         xb, yb = xb.to(device), yb.to(device)
         pred = model(xb)
-        loss = criterion(pred, yb)
-        total_loss += loss.item() * xb.size(0)
-    return total_loss / len(loader.dataset)
+        all_preds.append(pred)
+        all_targets.append(yb)
+    return compute_metrics(torch.cat(all_targets), torch.cat(all_preds))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -154,14 +169,22 @@ def objective(trial, in_channels=3, seq_len=32, max_epochs=100, device="cpu"):
 
     for epoch in range(max_epochs):
         train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss = evaluate(model, val_loader, criterion, device)
 
-        trial.report(val_loss, epoch)
+        # 按 epoch 用 MAE 做剪枝
+        model.eval()
+        val_mae_sum = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                val_mae_sum += nn.L1Loss()(model(xb), yb).item() * xb.size(0)
+        val_mae = val_mae_sum / len(val_loader.dataset)
+
+        trial.report(val_mae, epoch)
         if trial.should_prune():
             raise optuna.TrialPruned()
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_mae < best_val_loss:
+            best_val_loss = val_mae
             patience_counter = 0
         else:
             patience_counter += 1
