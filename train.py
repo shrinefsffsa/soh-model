@@ -18,6 +18,7 @@ SOH 预测模型训练脚本 — 使用预处理数据 + k-fold 交叉验证。
 import argparse
 import json
 import os
+import random
 import time
 from pathlib import Path
 
@@ -27,6 +28,18 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+
+# ═══════════════════════════════════════════════════════════════
+# 随机种子
+# ═══════════════════════════════════════════════════════════════
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 from model_v2 import MainSOHModelV2
 from data_loader import (
@@ -167,11 +180,17 @@ def main():
     parser.add_argument("--device", type=str, default="auto",
                         choices=["auto", "cpu", "cuda"],
                         help="设备 (default: auto)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="随机种子 (default: 42)")
     parser.add_argument("--output_dir", type=str, default="./results",
                         help="结果输出目录 (default: ./results)")
     parser.add_argument("--base_dir", type=str, default=".",
                         help="数据根目录 (default: 当前目录)")
     args = parser.parse_args()
+
+    # ── 固定随机种子 ──
+    set_seed(args.seed)
+    print(f"随机种子: {args.seed}")
 
     # ── 设备 ──
     if args.device == "auto":
