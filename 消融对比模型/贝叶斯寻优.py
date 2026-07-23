@@ -33,22 +33,20 @@ from data_loader import DATASET_REGISTRY, load_fold, get_fold_count
 
 # ── 模型注册表 ──────────────────────────────────────────
 MODEL_REGISTRY = {
-    "ptca":     ("消融对比模型.ptca_net",           "PTCANet"),
-    "bigru":    ("主模型.comparison_models",          "PureBiGRUModel"),
-    "tcn":      ("主模型.comparison_models",          "PureTCNModel"),
-    "noattn":   ("主模型.comparison_models",          "NoAttentionModel"),
-    "residual": ("主模型.model_v2_residual",          "MainSOHModelV2Residual"),
-    "main":     ("主模型.model_v2",                    "MainSOHModelV2"),
+    "ptca": ("消融对比模型/ptca_net.py",  "PTCANet"),
+    "main": ("主模型/model_v2.py",        "MainSOHModelV2"),
 }
 
 
 def get_model_class(model_name):
-    """动态导入指定模型"""
+    """动态导入指定模型（无需 __init__.py）"""
     if model_name not in MODEL_REGISTRY:
         raise ValueError(f"未知模型: {model_name}，可选: {list(MODEL_REGISTRY.keys())}")
-    module_path, class_name = MODEL_REGISTRY[model_name]
-    import importlib
-    module = importlib.import_module(module_path)
+    file_path, class_name = MODEL_REGISTRY[model_name]
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(class_name, file_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     return getattr(module, class_name)
 
 
@@ -156,7 +154,7 @@ def evaluate_fold(model, loader, device):
 # ═══════════════════════════════════════════════════════════════
 # 4. Optuna 目标函数 — k-fold 交叉验证
 # ═══════════════════════════════════════════════════════════════
-def objective(trial, dataset, seq_len, max_epochs, device):
+def objective(trial, dataset, seq_len, max_epochs, device, seed=42):
     params = suggest_hyperparams(trial)
     n_folds = get_fold_count(dataset, seq_len)
 
@@ -271,9 +269,9 @@ def main():
 
         # ── 搜索（SQLite 持久化，所有 trial 写入磁盘） ──
         os.makedirs("results", exist_ok=True)
-    db_path = f"results/optuna_{args.dataset}_n{args.seq_len}.db"
+    db_path = f"results/optuna_{args.model}_{args.dataset}_n{args.seq_len}.db"
     study = optuna.create_study(
-        study_name=f"{args.dataset}_n{args.seq_len}",
+        study_name=f"{args.model}_{args.dataset}_n{args.seq_len}",
         direction="minimize",
         sampler=TPESampler(seed=args.seed),
         pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=1),
@@ -292,13 +290,13 @@ def main():
 
     # ── 导出所有 trial 数据（论文用） ──
     trials_df = study.trials_dataframe()
-    trials_df.to_csv(f"results/all_trials_{args.dataset}_n{args.seq_len}.csv", index=False)
+    trials_df.to_csv(f"results/all_trials_{args.model}_{args.dataset}_n{args.seq_len}.csv", index=False)
     print(f"全部 {len(study.trials)} 个 trial 已保存到 results/all_trials_{args.dataset}_n{args.seq_len}.csv")
 
     # 超参重要性
     try:
         importance = optuna.importance.get_param_importances(study)
-        with open(f"results/param_importance_{args.dataset}_n{args.seq_len}.json", "w") as f:
+        with open(f"results/param_importance_{args.model}_{args.dataset}_n{args.seq_len}.json", "w") as f:
             json.dump({k: float(v) for k, v in importance.items()}, f, indent=2)
         print("超参数重要性：")
         for k, v in sorted(importance.items(), key=lambda x: -x[1]):
@@ -311,7 +309,7 @@ def main():
         print(f"  {key}: {value}")
 
     # 保存最佳参数
-    out_path = f"results/best_params_{args.dataset}_n{args.seq_len}.json"
+    out_path = f"results/best_params_{args.model}_{args.dataset}_n{args.seq_len}.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"best_mae": study.best_value, **study.best_params}, f, indent=2, ensure_ascii=False)
     print(f"\n参数已保存: {out_path}")
