@@ -33,8 +33,9 @@ from data_loader import DATASET_REGISTRY, load_fold, get_fold_count
 
 # ── 模型注册表 ──────────────────────────────────────────
 MODEL_REGISTRY = {
-    "ptca": ("消融对比模型/ptca_net.py",  "PTCANet"),
-    "main": ("主模型/model_v2.py",        "MainSOHModelV2"),
+    "ptca":    ("消融对比模型/ptca_net.py",        "PTCANet"),
+    "cnnlstm": ("消融对比模型/cnn_trans_lstm.py",  "CNNTransLSTM"),
+    "main":    ("主模型/model_v2.py",              "MainSOHModelV2"),
 }
 
 
@@ -154,7 +155,7 @@ def evaluate_fold(model, loader, device):
 # ═══════════════════════════════════════════════════════════════
 # 4. Optuna 目标函数 — k-fold 交叉验证
 # ═══════════════════════════════════════════════════════════════
-def objective(trial, dataset, seq_len, max_epochs, device, seed=42):
+def objective(trial, dataset, seq_len, max_epochs, device, ModelClass, seed=42):
     params = suggest_hyperparams(trial)
     n_folds = get_fold_count(dataset, seq_len)
 
@@ -279,7 +280,7 @@ def main():
         load_if_exists=True,
     )
 
-    func = lambda trial: objective(trial, args.dataset, args.seq_len, args.epochs, device, args.seed)
+    func = lambda trial: objective(trial, args.dataset, args.seq_len, args.epochs, device, ModelClass, args.seed)
 
     t_start = time.time()
     study.optimize(func, n_trials=args.trials, show_progress_bar=True)
